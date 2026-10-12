@@ -180,6 +180,11 @@ class GreeCloudClimateEntity(GreeCloudEntity, ClimateEntity):
         """Initialize the Gree Cloud device."""
         super().__init__(coordinator)
         self._attr_unique_id = coordinator.device.device_info.mac
+        # Discovery runs the first refresh before the platforms are set up, so
+        # the unit is usually known here. Without this the entity starts in
+        # Celsius and a Fahrenheit unit's values are reported as Celsius until
+        # the first coordinator update.
+        self._apply_temperature_units()
 
     @property
     def _supports_dry_target(self) -> bool:
@@ -430,6 +435,11 @@ class GreeCloudClimateEntity(GreeCloudEntity, ClimateEntity):
 
     def _handle_coordinator_update(self) -> None:
         """Update the state of the entity."""
+        self._apply_temperature_units()
+        super()._handle_coordinator_update()
+
+    def _apply_temperature_units(self) -> None:
+        """Match the temperature unit and setpoint range to the device."""
         units = self.coordinator.device.temperature_units
         if (
             units == TemperatureUnits.C
@@ -447,5 +457,3 @@ class GreeCloudClimateEntity(GreeCloudEntity, ClimateEntity):
             self._attr_temperature_unit = UnitOfTemperature.FAHRENHEIT
             self._attr_min_temp = TEMP_MIN_F
             self._attr_max_temp = TEMP_MAX_F
-
-        super()._handle_coordinator_update()
