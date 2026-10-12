@@ -6,6 +6,8 @@ import logging
 from typing import Any
 
 from greeclimate_davo22.device import (
+    HUMIDITY_MAX,
+    HUMIDITY_MIN,
     TEMP_MAX,
     TEMP_MAX_F,
     TEMP_MIN,
@@ -45,8 +47,10 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import (
     DISPATCH_DEVICE_DISCOVERED,
+    DRY_MODES_REVERSE,
     FAN_MEDIUM_HIGH,
     FAN_MEDIUM_LOW,
+    HUMIDITY_STEP,
     TARGET_TEMPERATURE_STEP,
     TARGET_TEMPERATURE_STEP_HALF,
 )
@@ -168,11 +172,65 @@ class GreeCloudClimateEntity(GreeCloudEntity, ClimateEntity):
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_min_temp = TEMP_MIN
     _attr_max_temp = TEMP_MAX
+    _attr_min_humidity = HUMIDITY_MIN
+    _attr_max_humidity = HUMIDITY_MAX
+    _attr_target_humidity_step = HUMIDITY_STEP
 
     def __init__(self, coordinator: CloudDeviceDataUpdateCoordinator) -> None:
         """Initialize the Gree Cloud device."""
         super().__init__(coordinator)
         self._attr_unique_id = coordinator.device.device_info.mac
+
+    @property
+    def _supports_dry_target(self) -> bool:
+        """Return whether the unit reports a dry attribute and its target."""
+        device = self.coordinator.device
+        return (
+            device.get_property(Props.DEHUMIDIFIER_MODE) is not None
+            and device.get_property(Props.HUM_SET) is not None
+        )
+
+    @property
+    def supported_features(self) -> ClimateEntityFeature:
+        """Return the features, adding a humidity target where the unit has one."""
+        features = self._attr_supported_features
+        if self._supports_dry_target:
+            features |= ClimateEntityFeature.TARGET_HUMIDITY
+        return features
+
+    @property
+    def target_humidity(self) -> int | None:
+        """Return the dry target (Dwet) as %RH."""
+        if not self._supports_dry_target:
+            return None
+        return self.coordinator.device.target_humidity
+
+    async def async_set_humidity(self, humidity: int) -> None:
+        """Set the dry target (Dwet), in the unit's 5 % steps.
+
+        Only the target is written. Whether the unit dries to it is the dry
+        attribute (Dmod), set through the dry-mode select, so a caller can
+        choose Smart in Cool or Normal / Continuous in Dry independently.
+        """
+        value = round(humidity / HUMIDITY_STEP) * HUMIDITY_STEP
+        value = max(HUMIDITY_MIN, min(HUMIDITY_MAX, value))
+        _LOGGER.debug(
+            "Setting dry target to %s%% (asked %s) for %s",
+            value,
+            humidity,
+            self.coordinator.device.device_info.name,
+        )
+        self.coordinator.device.target_humidity = value
+        await self.coordinator.push_state_update()
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose the dry attribute beside the climate state."""
+        if not self._supports_dry_target:
+            return None
+        raw = self.coordinator.device.get_property(Props.DEHUMIDIFIER_MODE)
+        return {"dry_mode": DRY_MODES_REVERSE.get(raw), "dry_mode_raw": raw}
 
     @property
     def _supports_half_degree(self) -> bool:
