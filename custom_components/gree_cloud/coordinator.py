@@ -72,8 +72,29 @@ class HWHPAwareCloudDevice(CloudDevice):
     read by the sensor platform.
     """
 
+    async def bind(self, key: str = None, cipher=None):
+        """Bind to the device, tolerating a unit that is silent at bind time.
+
+        update_state() below raises on a status timeout (#41). bind() calls it
+        during discovery and after an MQTT reconnect, where a unit that happens
+        to be offline must not abort setup or the reconnect; the coordinator's
+        next poll counts the miss instead.
+        """
+        try:
+            await super().bind(key, cipher)
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "No initial state from %s at bind; the next poll will retry",
+                self.device_info.name,
+            )
+
     async def update_state(self) -> None:
-        """Update device state, including HWHP-specific properties."""
+        """Update device state, including HWHP-specific properties.
+
+        Raises asyncio.TimeoutError when the device does not answer, so the
+        coordinator counts the miss and marks entities unavailable after
+        MAX_ERRORS consecutive misses (#41).
+        """
         _LOGGER.debug(
             "Updating HWHP-aware cloud device state: %s", self.device_info.name
         )
@@ -104,6 +125,7 @@ class HWHPAwareCloudDevice(CloudDevice):
             _LOGGER.warning(
                 "Timeout waiting for state update from %s", self.device_info.name
             )
+            raise
         finally:
             self._response_event = None
             self._response_data = None
