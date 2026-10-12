@@ -58,6 +58,19 @@ PROP_COMPRESSOR_FREQ = "CompressorFqy"
 # it needs no extra request - only an entity to surface it.
 PROP_HUMIDITY = "DwatSen"
 
+# Dry attribute (Props.DEHUMIDIFIER_MODE, "Dmod") on air conditioners, as the
+# Gree+ app sets it: Cool offers Smart, Dry offers Normal and Continuous.
+# Observed on a Livo R32 and (per PR #28) a Clivia. The target it dries to is
+# Props.HUM_SET ("Dwet"), %RH = 5 * Dwet + 15.
+DRY_MODES = {
+    "off": 15,
+    "normal": 0,
+    "continuous": 1,
+    "smart": 2,
+}
+DRY_MODES_REVERSE = {v: k for k, v in DRY_MODES.items()}
+HUMIDITY_STEP = 5
+
 # Gree Cloud servers
 GREE_CLOUD_SERVERS = {
     "Australia": "https://augrih.gree.com",
