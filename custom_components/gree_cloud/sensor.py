@@ -33,9 +33,21 @@ from .const import (
 from .coordinator import (
     CloudDeviceDataUpdateCoordinator,
     GreeCloudConfigEntry,
+    HWHPAwareCloudDevice,
     is_hwhp_device,
 )
 from .entity import GreeCloudEntity
+
+
+def _measured(device: Device, key: str) -> float | None:
+    """Return a measured property, or None if the unit stopped reporting it.
+
+    The library keeps the last value of a property a reply omits, so a held
+    value would otherwise be shown as current indefinitely (STALE_AFTER).
+    """
+    if isinstance(device, HWHPAwareCloudDevice) and not device.is_fresh(key):
+        return None
+    return device.raw_properties.get(key)
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -65,8 +77,8 @@ def _has_energy_total(device: Device) -> bool:
 
 
 def _compressor_frequency(device: Device) -> float | None:
-    """Return compressor frequency in Hz."""
-    return device.raw_properties.get(PROP_COMPRESSOR_FREQ)
+    """Return compressor frequency in Hz, or None once it is stale."""
+    return _measured(device, PROP_COMPRESSOR_FREQ)
 
 
 def _has_compressor_frequency(device: Device) -> bool:
@@ -79,8 +91,8 @@ def _has_compressor_frequency(device: Device) -> bool:
 
 
 def _humidity(device: Device) -> float | None:
-    """Return relative humidity in percent."""
-    return device.raw_properties.get(PROP_HUMIDITY)
+    """Return relative humidity in percent, or None once it is stale."""
+    return _measured(device, PROP_HUMIDITY)
 
 
 def _has_humidity(device: Device) -> bool:

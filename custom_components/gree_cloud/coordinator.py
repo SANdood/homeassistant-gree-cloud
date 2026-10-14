@@ -7,11 +7,18 @@ import copy
 from dataclasses import dataclass
 from datetime import timedelta
 import logging
+from time import monotonic
 from typing import Any
 
 from greeclimate_davo22.cloud_api import CloudDeviceInfo, GreeCloudApi
 from greeclimate_davo22.cloud_device import CloudDevice
-from greeclimate_davo22.device import Props
+from greeclimate_davo22.device import (
+    TEMP_MAX_TABLE,
+    TEMP_MIN_TABLE,
+    TEMP_OFFSET,
+    Props,
+    TemperatureUnits,
+)
 from greeclimate_davo22.deviceinfo import DeviceInfo
 from greeclimate_davo22.mqtt_client import GreeMqttClient
 
@@ -37,6 +44,7 @@ from .const import (
     MAX_ERRORS,
     PROP_COMPRESSOR_FREQ,
     PROP_ENERGY_TOTAL,
+    STALE_AFTER,
     UPDATE_INTERVAL,
 )
 
@@ -58,6 +66,10 @@ _HWHP_EXTRA_PROPS = [
 # only available on this integration.
 _SENSOR_EXTRA_PROPS = [PROP_ENERGY_TOTAL, PROP_COMPRESSOR_FREQ]
 
+# Key under which the coordinator's snapshot lists stale properties. Not a
+# device property; nothing reads coordinator.data, it only drives updates.
+_STALE_DATA_KEY = "_stale"
+
 
 class HWHPAwareCloudDevice(CloudDevice):
     """CloudDevice subclass that also requests HWHP-specific properties.
@@ -70,7 +82,86 @@ class HWHPAwareCloudDevice(CloudDevice):
 
     The same mechanism requests ``ElcAll`` (cumulative energy) for AC units,
     read by the sensor platform.
+
+    It also records when each property was last reported, so measured values
+    the unit stops sending read unknown instead of being held (see
+    ``STALE_AFTER``), and it replaces the library's ``current_temperature``.
     """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the device and its per-property report times."""
+        super().__init__(*args, **kwargs)
+        self._reported_at: dict[str, float] = {}
+
+    def handle_state_update(self, **kwargs: Any) -> None:
+        """Record when each reported property arrived, then apply the update.
+
+        Every packet passes through here: poll replies and unsolicited status
+        pushes alike.
+        """
+        now = monotonic()
+        for key in kwargs:
+            self._reported_at[key] = now
+        # The library settles the TemSen encoding (+40 offset or raw) on the
+        # first packet that carries TemSen, even when it reads 0, and never
+        # looks again; a raw-encoding unit whose first reading is 0 is then
+        # decoded with the offset for good (greeclimate_davo22 2.3.0
+        # device.py:307-314, cmroche/greeclimate#196). Wait for a non-zero one.
+        defer_check = self.check_version and not kwargs.get(Props.TEMP_SENSOR.value)
+        super().handle_state_update(**kwargs)
+        if defer_check:
+            self.check_version = True
+
+    def is_fresh(self, key: str) -> bool:
+        """Return whether the unit reported this property within STALE_AFTER."""
+        reported = self._reported_at.get(key)
+        return reported is not None and monotonic() - reported <= STALE_AFTER
+
+    def stale_keys(self) -> list[str]:
+        """Return the properties not reported within STALE_AFTER."""
+        now = monotonic()
+        return sorted(
+            key for key, at in self._reported_at.items() if now - at > STALE_AFTER
+        )
+
+    @property
+    def current_temperature(self) -> int | None:
+        """Return the unit's own temperature sensor (TemSen), or None.
+
+        Replaces greeclimate_davo22 2.3.0 Device.current_temperature
+        (device.py:473-488), which makes the reading echo the setpoint twice:
+
+        - it returns target_temperature whenever TemSen is missing, reads 0 on
+          +40-offset firmware, or is out of range, so "no reading" looks
+          exactly like a reading equal to the setpoint;
+        - in Fahrenheit it decodes TemSen (whole degrees Celsius) through the
+          setpoint's TemRec bit, so one 24 C reading shows as 75 F or 76 F
+          depending on whether the setpoint is 75 or 76.
+
+        None (unknown) means no usable reading: TemSen never reported, not
+        reported within STALE_AFTER, 0 on offset firmware (no sensor), or out
+        of range. The encoding is the library's: raw on version-4 firmware
+        (from hid, or inferred from a first non-zero reading below 40), else
+        offset by +40.
+        """
+        raw = self.get_property(Props.TEMP_SENSOR)
+        if raw is None or not self.is_fresh(Props.TEMP_SENSOR.value):
+            return None
+        major = self.version and int(self.version.split(".")[0])
+        if major == 4:
+            celsius = raw
+        elif raw != 0:
+            celsius = raw - TEMP_OFFSET
+        else:
+            return None
+        if not TEMP_MIN_TABLE <= celsius <= TEMP_MAX_TABLE:
+            _LOGGER.warning(
+                "Ignoring out-of-range TemSen %s from %s", raw, self.device_info.name
+            )
+            return None
+        if self.temperature_units == TemperatureUnits.F:
+            return round(celsius * 9 / 5 + 32)
+        return celsius
 
     async def bind(self, key: str = None, cipher=None):
         """Bind to the device, tolerating a unit that is silent at bind time.
@@ -121,6 +212,13 @@ class HWHPAwareCloudDevice(CloudDevice):
             )
             if self._response_data:
                 self.handle_state_update(**self._response_data)
+            else:
+                # The library also sets the event for a reply that carries no
+                # state (a late command ack, a pack it could not decrypt or
+                # parse). Nothing is updated; values age out via STALE_AFTER.
+                _LOGGER.debug(
+                    "Status reply from %s carried no state", self.device_info.name
+                )
         except asyncio.TimeoutError:
             _LOGGER.warning(
                 "Timeout waiting for state update from %s", self.device_info.name
@@ -197,6 +295,18 @@ class CloudDeviceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.device = device
         self._error_count: int = 0
 
+    def _snapshot(self) -> dict[str, Any]:
+        """Copy the device state, including which measured values are stale.
+
+        With always_update=False an unchanged snapshot skips the entity
+        updates, so a value that merely ages out would never be shown as
+        unknown; listing the stale keys makes that a change.
+        """
+        data = copy.deepcopy(self.device.raw_properties)
+        if isinstance(self.device, HWHPAwareCloudDevice):
+            data[_STALE_DATA_KEY] = self.device.stale_keys()
+        return data
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Update the state of the device from cloud."""
         _LOGGER.debug(
@@ -207,7 +317,7 @@ class CloudDeviceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             await self.device.update_state()
             self._error_count = 0
-            return copy.deepcopy(self.device.raw_properties)
+            return self._snapshot()
 
         except asyncio.TimeoutError as error:
             self._error_count += 1
@@ -221,7 +331,7 @@ class CloudDeviceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     f"Cloud device {self.name} is unavailable, timeout"
                 ) from error
             # Return last known state if within error threshold
-            return copy.deepcopy(self.device.raw_properties)
+            return self._snapshot()
 
         except Exception as error:
             if _is_mqtt_disconnected(error):
@@ -234,7 +344,7 @@ class CloudDeviceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     try:
                         await self.device.update_state()
                         self._error_count = 0
-                        return copy.deepcopy(self.device.raw_properties)
+                        return self._snapshot()
                     except Exception as retry_error:
                         _LOGGER.warning(
                             "State update failed after reconnect for %s: %s",
@@ -248,7 +358,7 @@ class CloudDeviceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise UpdateFailed(
                     f"Cloud device {self.name} failed to update"
                 ) from error
-            return copy.deepcopy(self.device.raw_properties)
+            return self._snapshot()
 
     async def push_state_update(self):
         """Send state updates to the cloud device."""

@@ -15,6 +15,13 @@ DISCOVERY_TIMEOUT = 10
 MAX_ERRORS = 3
 MAX_EXPECTED_RESPONSE_TIME_INTERVAL = 180
 
+# A measured value (TemSen, CompressorFqy, DwatSen) the unit has not re-reported
+# for this many seconds is stale and reads unknown instead of being held. The
+# library merges every reply into raw_properties, so without this a value the
+# unit stops sending keeps its last reading forever. 3.5 poll intervals: a value
+# survives the same two missed polls the coordinator tolerates (MAX_ERRORS).
+STALE_AFTER = UPDATE_INTERVAL * MAX_ERRORS + UPDATE_INTERVAL // 2
+
 # Dispatcher signals
 DISPATCH_DEVICE_DISCOVERED = f"{DOMAIN}_device_discovered"
 
